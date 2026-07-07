@@ -1,0 +1,765 @@
+// ════════════════════════════════════════════════════════════════════════
+// Karaoke App — Prisma Schema (PostgreSQL)
+// Multi-tenant: 1 platform phục vụ CẢ B2C (ads + premium) và B2B (tiệm karaoke).
+//   - B2C: User.shopId = null (thuộc nền PUBLIC). Kiếm tiền: ads + Premium.
+//   - B2B: mỗi tiệm = 1 Shop (tenant). OWNER/STAFF/khách thuộc shopId.
+// Quy ước: id = cuid(); tiền = Int (VND); soft-delete (deletedAt) nơi cần;
+//          index đầy đủ cho FK + cột lọc/sort.
+// ════════════════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║ ENUMS                                                                  ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+// Quyền tăng dần: USER < STAFF < OWNER < ADMIN < SUPER_ADMIN (bỏ MODERATOR)
+enum Role {
+  USER // người hát (B2C) / khách tiệm (B2B); shopId thường null với B2C
+  STAFF // nhân viên tiệm (lễ tân/thu ngân) — bắt buộc shopId
+  OWNER // chủ tiệm — bắt buộc shopId
+  ADMIN // nhân viên vận hành platform — shopId null
+  SUPER_ADMIN // chủ platform, toàn quyền + billing — shopId null
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED // khoá tạm
+  BANNED // cấm vĩnh viễn
+}
+
+enum ShopStatus {
+  TRIAL
+  ACTIVE
+  SUSPENDED
+  EXPIRED
+}
+
+// ── B2C content ──
+enum ReportStatus {
+  PENDING
+  RESOLVED
+  REJECTED
+}
+
+// ── B2B operations ──
+enum RoomStatus {
+  AVAILABLE
+  OCCUPIED
+  CLEANING
+  MAINTENANCE
+}
+
+enum SessionStatus {
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
+enum RoomQueueStatus {
+  QUEUED
+  PLAYING
+  PLAYED
+  SKIPPED
+}
+
+enum OrderStatus {
+  PENDING
+  PREPARING
+  SERVED
+  PAID
+  CANCELLED
+}
+
+enum ProductCategory {
+  DRINK
+  BEER
+  FOOD
+  SNACK
+  OTHER
+}
+
+// ── Billing ──
+enum UserPlan {
+  FREE
+  PREMIUM_MONTHLY
+  PREMIUM_YEARLY
+}
+
+enum ShopPlan {
+  SHOP_BASIC
+  SHOP_PRO
+}
+
+enum SubscriberType {
+  USER
+  SHOP
+}
+
+enum SubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  REFUNDED
+}
+
+enum PaymentProvider {
+  VNPAY
+  MOMO
+  STRIPE
+  CASH
+  BANK_TRANSFER
+}
+
+enum DiscountType {
+  PERCENT // value = 0..100
+  FIXED // value = VND
+}
+
+// ── Platform ──
+enum AppPlatform {
+  ANDROID
+  IOS
+}
+
+enum AnnouncementAudience {
+  ALL
+  PREMIUM
+  FREE
+  SHOP
+}
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║ IDENTITY + TENANCY + AUTH                                              ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+// Tenant = 1 tiệm karaoke (B2B). B2C không có Shop (User.shopId null).
+model Shop {
+  id          String     @id @default(cuid())
+  name        String
+  slug        String     @unique
+  ownerId     String? // User.id của OWNER; nullable để tạo tiệm trước, gán owner sau
+  status      ShopStatus @default(TRIAL)
+  address     String?
+  phone       String?
+  timezone    String     @default("Asia/Ho_Chi_Minh")
+  logoUrl     String?
+  settings    Json? // cấu hình riêng tiệm
+  trialEndsAt DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+  deletedAt   DateTime?
+
+  owner         User?          @relation("ShopOwner", fields: [ownerId], references: [id], onDelete: SetNull)
+  users         User[]         @relation("ShopMembers")
+  rooms         Room[]
+  playSessions  PlaySession[]
+  products      Product[]
+  orders        Order[]
+  subscriptions Subscription[]
+  payments      Payment[]
+  auditLogs     AuditLog[]
+  announcements Announcement[]
+
+  @@index([status])
+  @@index([ownerId])
+  @@index([deletedAt])
+}
+
+model User {
+  id              String     @id @default(cuid())
+  email           String?    @unique // nullable: khách tiệm / OAuth có thể không email
+  phone           String?    @unique
+  passwordHash    String? // null nếu chỉ đăng nhập OAuth
+  googleId        String?    @unique
+  displayName     String
+  avatarUrl       String?
+  bio             String?
+  role            Role       @default(USER)
+  shopId          String? // null = B2C/platform; có = thành viên tiệm
+  isEmailVerified Boolean    @default(false)
+  isPremium       Boolean    @default(false) // B2C: đã mua gói bỏ ads
+  premiumUntil    DateTime?
+  status          UserStatus @default(ACTIVE)
+  lastLoginAt     DateTime?
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+  deletedAt       DateTime?
+
+  // Tenancy
+  shop       Shop?  @relation("ShopMembers", fields: [shopId], references: [id], onDelete: SetNull)
+  ownedShops Shop[] @relation("ShopOwner")
+
+  // Auth
+  refreshTokens      RefreshToken[]
+  verificationTokens VerificationToken[]
+
+  // B2C content
+  playlists     Playlist[]
+  favorites     Favorite[]
+  history       History[]
+  queueItems    QueueItem[]
+  songReports   SongReport[]
+  searchHistory SearchHistory[]
+
+  // B2B
+  openedSessions PlaySession[] @relation("SessionOpenedBy")
+
+  // Billing
+  subscriptions Subscription[]
+  payments      Payment[]
+
+  // Platform
+  auditLogs              AuditLog[]              @relation("AuditLogActor")
+  systemSettings         SystemSetting[]         @relation("SystemSettingUpdatedBy")
+  featureFlags           FeatureFlag[]           @relation("FeatureFlagUpdatedBy")
+  appVersionConfigs      AppVersionConfig[]      @relation("AppVersionUpdatedBy")
+  announcementsCreated   Announcement[]          @relation("AnnouncementCreator")
+  notificationRecipients NotificationRecipient[]
+
+  @@index([email])
+  @@index([phone])
+  @@index([shopId])
+  @@index([role])
+  @@index([shopId, role])
+  @@index([status])
+  @@index([deletedAt])
+}
+
+// 1 row = 1 phiên đăng nhập. ip/userAgent để hiển thị "thiết bị đang đăng nhập"
+// + đăng xuất từ xa (revokedAt). Không cần bảng LoginDevice riêng.
+model RefreshToken {
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique // lưu HASH của token, không plaintext
+  ip        String? // IP lúc đăng nhập
+  userAgent String? // thiết bị/trình duyệt
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([userId, revokedAt])
+}
+
+// 1 bảng chung cho MỌI token xác thực (verify email, reset mật khẩu, verify
+// phone) — phân biệt bằng `purpose`. Gọn hơn tách nhiều bảng (như OtpCode ở
+// sports_booking).
+enum VerificationPurpose {
+  EMAIL_VERIFY
+  PASSWORD_RESET
+  PHONE_VERIFY
+}
+
+model VerificationToken {
+  id        String              @id @default(cuid())
+  userId    String
+  tokenHash String              @unique // lưu HASH của token/OTP, không plaintext
+  purpose   VerificationPurpose
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, purpose])
+  @@index([expiresAt])
+}
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║ B2C CONTENT (bài hát cache YouTube, lyrics, playlist, queue...)        ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+model Category {
+  id        String   @id @default(cuid())
+  slug      String   @unique // bolero, vpop, usuk...
+  name      String
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  songs Song[]
+}
+
+// Cache metadata YouTube (KHÔNG lưu video/audio — chỉ embed khi phát).
+model Song {
+  youtubeId     String   @id
+  title         String
+  artist        String?
+  thumbnailUrl  String?
+  duration      Int      @default(0) // giây
+  viewCount     Int      @default(0)
+  playCountApp  Int      @default(0) // lượt phát trong app (trending)
+  hasLyrics     Boolean  @default(false)
+  isKaraoke     Boolean  @default(true)
+  isAvailable   Boolean  @default(true) // false = video bị gỡ/chặn nhúng
+  categoryId    String?
+  cachedAt      DateTime @default(now())
+  lastCheckedAt DateTime @default(now())
+
+  category      Category?      @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  lyrics        Lyrics?
+  favorites     Favorite[]
+  history       History[]
+  queueItems    QueueItem[]
+  playlistItems PlaylistItem[]
+  reports       SongReport[]
+
+  @@index([title])
+  @@index([artist])
+  @@index([categoryId])
+  @@index([playCountApp])
+}
+
+model Lyrics {
+  id         String   @id @default(cuid())
+  songId     String   @unique
+  lrcContent String   @db.Text
+  source     String // 'lrclib' | 'musixmatch'
+  language   String?
+  isVerified Boolean  @default(false)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  song Song @relation(fields: [songId], references: [youtubeId], onDelete: Cascade)
+}
+
+model Playlist {
+  id          String    @id @default(cuid())
+  userId      String
+  name        String
+  description String?
+  isPublic    Boolean   @default(false)
+  coverUrl    String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  deletedAt   DateTime?
+
+  user  User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items PlaylistItem[]
+
+  @@index([userId])
+}
+
+model PlaylistItem {
+  id         String   @id @default(cuid())
+  playlistId String
+  songId     String
+  position   Int
+  addedAt    DateTime @default(now())
+
+  playlist Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  song     Song     @relation(fields: [songId], references: [youtubeId], onDelete: Cascade)
+
+  @@unique([playlistId, songId])
+  @@index([playlistId, position])
+}
+
+// Hàng chờ CÁ NHÂN của B2C user (khác RoomQueueItem của tiệm).
+model QueueItem {
+  id       String   @id @default(cuid())
+  userId   String
+  songId   String
+  position Int
+  addedAt  DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  song Song @relation(fields: [songId], references: [youtubeId], onDelete: Cascade)
+
+  @@index([userId, position])
+}
+
+model Favorite {
+  id        String   @id @default(cuid())
+  userId    String
+  songId    String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  song Song @relation(fields: [songId], references: [youtubeId], onDelete: Cascade)
+
+  @@unique([userId, songId])
+  @@index([userId])
+}
+
+model History {
+  id            String   @id @default(cuid())
+  userId        String
+  songId        String
+  playedAt      DateTime @default(now())
+  secondsPlayed Int? // số giây hát thực tế
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  song Song @relation(fields: [songId], references: [youtubeId], onDelete: Cascade)
+
+  @@index([userId, playedAt])
+}
+
+// Báo bài lỗi (link YouTube chết / nội dung không phù hợp) — ADMIN xử lý.
+model SongReport {
+  id         String       @id @default(cuid())
+  userId     String
+  songId     String
+  reason     String
+  detail     String?
+  status     ReportStatus @default(PENDING)
+  createdAt  DateTime     @default(now())
+  resolvedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  song Song @relation(fields: [songId], references: [youtubeId], onDelete: Cascade)
+
+  @@index([status])
+}
+
+// Lịch sử tìm kiếm theo user — đồng bộ web ↔ mobile. Dedupe theo (userId, query);
+// tìm lại 1 từ khoá cũ → cập nhật createdAt để đẩy lên đầu.
+model SearchHistory {
+  id        String   @id @default(cuid())
+  userId    String
+  query     String
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, query])
+  @@index([userId, createdAt])
+}
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║ B2B SHOP OPERATIONS — dùng khi triển khai bán cho tiệm (multi-tenant)  ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+model Room {
+  id          String     @id @default(cuid())
+  shopId      String
+  name        String
+  code        String? // mã ngắn, unique trong 1 tiệm
+  status      RoomStatus @default(AVAILABLE)
+  capacity    Int?
+  roomType    String? // "VIP" | "Standard"...
+  hourlyPrice Int        @default(0) // VND/giờ
+  isActive    Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  shop     Shop          @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  sessions PlaySession[]
+
+  @@unique([shopId, code])
+  @@index([shopId, status])
+  @@index([shopId, isActive])
+}
+
+// 1 phiên dùng phòng (check-in → check-out).
+model PlaySession {
+  id              String        @id @default(cuid())
+  shopId          String // denormalized từ Room để cô lập/filter nhanh
+  roomId          String
+  status          SessionStatus @default(OPEN)
+  openedByStaffId String? // nhân viên mở phiên (STAFF/OWNER)
+  guestCount      Int?
+  startedAt       DateTime      @default(now())
+  plannedMinutes  Int? // số phút khách đặt trước (null = mở, tính giờ khi đóng)
+  expiresAt       DateTime? // startedAt + plannedMinutes; cập nhật khi gia hạn
+  endedAt         DateTime?
+  roomCharge      Int           @default(0) // tiền phòng (VND)
+  totalAmount     Int           @default(0) // roomCharge + F&B (VND)
+  note            String?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  shop       Shop            @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  room       Room            @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  openedBy   User?           @relation("SessionOpenedBy", fields: [openedByStaffId], references: [id], onDelete: SetNull)
+  queueItems RoomQueueItem[]
+  orders     Order[]
+
+  @@index([shopId, status])
+  @@index([roomId, startedAt])
+  @@index([openedByStaffId])
+}
+
+// Hàng chờ bài TRONG PHÒNG — khách hát ẩn danh theo phiên (KHÔNG gắn userId).
+model RoomQueueItem {
+  id            String          @id @default(cuid())
+  sessionId     String
+  songYoutubeId String // free-text (có thể bài chưa cache vào Song)
+  songTitle     String // denormalized để render không cần join
+  songThumbnail String?
+  position      Int
+  status        RoomQueueStatus @default(QUEUED)
+  addedAt       DateTime        @default(now())
+  playedAt      DateTime?
+
+  session PlaySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([sessionId, position])
+  @@index([sessionId, status])
+  @@index([songYoutubeId])
+}
+
+model Product {
+  id        String          @id @default(cuid())
+  shopId    String
+  name      String
+  price     Int             @default(0) // VND
+  category  ProductCategory @default(OTHER)
+  imageUrl  String?
+  isActive  Boolean         @default(true)
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  shop       Shop        @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  orderItems OrderItem[]
+
+  @@index([shopId, isActive])
+  @@index([shopId, category])
+}
+
+model Order {
+  id          String      @id @default(cuid())
+  shopId      String
+  sessionId   String
+  status      OrderStatus @default(PENDING)
+  totalAmount Int         @default(0) // VND
+  note        String?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  shop    Shop        @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  session PlaySession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  items   OrderItem[]
+
+  @@index([shopId, status])
+  @@index([sessionId])
+  @@index([shopId, createdAt])
+}
+
+model OrderItem {
+  id        String   @id @default(cuid())
+  orderId   String
+  productId String? // SetNull để giữ lịch sử khi product bị xoá
+  name      String // snapshot tên sản phẩm lúc bán
+  qty       Int      @default(1)
+  unitPrice Int      @default(0) // snapshot đơn giá VND
+  lineTotal Int      @default(0) // qty * unitPrice
+  createdAt DateTime @default(now())
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([productId])
+}
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║ MONETIZATION & BILLING (Premium B2C + License B2B + Payments)         ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+// ĐÚNG 1 trong (userId | shopId) khớp subscriberType (enforce ở service layer).
+model Subscription {
+  id                 String             @id @default(cuid())
+  subscriberType     SubscriberType
+  userId             String? // khi subscriberType = USER (B2C)
+  shopId             String? // khi subscriberType = SHOP (B2B)
+  userPlan           UserPlan? // gói B2C
+  shopPlan           ShopPlan? // gói B2B
+  status             SubscriptionStatus @default(TRIALING)
+  currentPeriodStart DateTime
+  currentPeriodEnd   DateTime
+  autoRenew          Boolean            @default(true)
+  cancelAtPeriodEnd  Boolean            @default(false)
+  trialEndsAt        DateTime?
+  cancelledAt        DateTime?
+  createdAt          DateTime           @default(now())
+  updatedAt          DateTime           @updatedAt
+
+  user     User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  shop     Shop?     @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  payments Payment[]
+
+  @@index([userId])
+  @@index([shopId])
+  @@index([status, currentPeriodEnd])
+  @@index([subscriberType])
+}
+
+// Bản ghi tài chính — KHÔNG soft delete (giữ vĩnh viễn để đối soát).
+model Payment {
+  id             String          @id @default(cuid())
+  amount         Int // VND
+  currency       String          @default("VND")
+  provider       PaymentProvider
+  status         PaymentStatus   @default(PENDING)
+  externalRef    String? // mã GD từ cổng
+  description    String?
+  failureReason  String?
+  subscriptionId String?
+  userId         String?
+  shopId         String?
+  voucherId      String?
+  refundedAmount Int?
+  paidAt         DateTime?
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  subscription Subscription? @relation(fields: [subscriptionId], references: [id], onDelete: SetNull)
+  voucher      Voucher?      @relation(fields: [voucherId], references: [id], onDelete: SetNull)
+  user         User?         @relation(fields: [userId], references: [id], onDelete: SetNull)
+  shop         Shop?         @relation(fields: [shopId], references: [id], onDelete: SetNull)
+
+  @@unique([provider, externalRef]) // idempotency chống ghi trùng GD cổng
+  @@index([status])
+  @@index([shopId])
+  @@index([userId])
+  @@index([subscriptionId])
+  @@index([createdAt])
+}
+
+model Voucher {
+  id           String       @id @default(cuid())
+  code         String       @unique
+  description  String?
+  discountType DiscountType
+  value        Int // PERCENT: 0..100 ; FIXED: VND
+  maxDiscount  Int? // trần giảm khi PERCENT (VND)
+  minAmount    Int? // đơn tối thiểu để áp (VND)
+  validFrom    DateTime
+  validTo      DateTime
+  maxUses      Int?
+  usedCount    Int          @default(0)
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  payments Payment[]
+
+  @@index([code])
+  @@index([isActive, validFrom, validTo])
+}
+
+// ⚠️ ADS đã tạm gỡ khỏi schema (model AdConfig). Khi tích hợp lại, xem tài liệu
+//    + bảng paste-ready ở: prisma/ADS.md
+
+// ╔══════════════════════════════════════════════════════════════════════╗
+// ║ PLATFORM / ADMIN / OPS                                                 ║
+// ╚══════════════════════════════════════════════════════════════════════╝
+
+model AuditLog {
+  id           String   @id @default(cuid())
+  actorId      String?
+  actorRole    Role?
+  action       String // CREATE_ORDER, UPDATE_SHOP, REFUND...
+  resourceType String
+  resourceId   String?
+  beforeJson   Json?
+  afterJson    Json?
+  shopId       String?
+  ip           String?
+  userAgent    String?
+  createdAt    DateTime @default(now())
+
+  actor User? @relation("AuditLogActor", fields: [actorId], references: [id], onDelete: SetNull)
+  shop  Shop? @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@index([resourceType, resourceId])
+  @@index([actorId, createdAt])
+  @@index([shopId])
+  @@index([createdAt])
+}
+
+model SystemSetting {
+  key       String   @id
+  value     Json
+  updatedBy String?
+  updatedAt DateTime @updatedAt
+
+  updatedByUser User? @relation("SystemSettingUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+
+  @@index([updatedBy])
+}
+
+model FeatureFlag {
+  key         String   @id
+  enabled     Boolean  @default(false)
+  description String?
+  updatedBy   String?
+  updatedAt   DateTime @updatedAt
+
+  updatedByUser User? @relation("FeatureFlagUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+
+  @@index([updatedBy])
+}
+
+// Force / optional update theo platform (chủ yếu B2C mobile).
+model AppVersionConfig {
+  platform        AppPlatform @id
+  latestVersion   String      @default("1.0.0")
+  minVersion      String      @default("1.0.0") // dưới mức này → force
+  forceUpdate     Boolean     @default(false)
+  forceMessage    String?
+  optionalMessage String?
+  storeUrl        String?
+  enabled         Boolean     @default(true)
+  updatedBy       String?
+  updatedAt       DateTime    @updatedAt
+
+  updatedByUser User? @relation("AppVersionUpdatedBy", fields: [updatedBy], references: [id], onDelete: SetNull)
+
+  @@index([updatedBy])
+}
+
+model Announcement {
+  id        String               @id @default(cuid())
+  title     String
+  body      String               @db.Text
+  audience  AnnouncementAudience @default(ALL)
+  shopId    String? // bắt buộc khi audience = SHOP
+  isActive  Boolean              @default(true)
+  startsAt  DateTime?
+  endsAt    DateTime?
+  createdBy String?
+  createdAt DateTime             @default(now())
+  updatedAt DateTime             @updatedAt
+
+  shop       Shop?                   @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  creator    User?                   @relation("AnnouncementCreator", fields: [createdBy], references: [id], onDelete: SetNull)
+  recipients NotificationRecipient[]
+
+  @@index([audience, isActive])
+  @@index([shopId])
+  @@index([isActive, startsAt, endsAt])
+  @@index([createdBy])
+}
+
+model NotificationRecipient {
+  id             String    @id @default(cuid())
+  announcementId String
+  userId         String
+  readAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  announcement Announcement @relation(fields: [announcementId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([announcementId, userId])
+  @@index([userId, readAt])
+}
